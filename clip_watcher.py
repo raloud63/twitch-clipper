@@ -212,7 +212,7 @@ def watch(args):
     jobs = Queue()
     clips = Path(args.out) / 'clips'
     clips.mkdir(parents=True, exist_ok=True)
-    log_file = clips / 'spikes.csv'
+    log_file = clips / f'{args.channel}_spikes.csv'
     new_log = not log_file.exists()
     with open(log_file, 'a', newline='') as f:
         if new_log:
