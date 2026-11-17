@@ -4,15 +4,10 @@
 How it works
   1. Streamlink records the stream to disk from the moment it goes live.
   2. Twitch chat is read anonymously (read-only, no account, no token) and counted every 10 seconds.
-  3. When a 10-second count jumps well above the recent normal, that moment is a spike.
-  4. FFmpeg cuts 30 seconds around the spike from the recording, while the stream keeps going.
+  3. When a 10-second count jumps well above the recent normal, a dynamic clip window opens:
+     it looks back if chat was already heating up, and extends forward while chat stays active (up to 58s).
+  4. FFmpeg cuts the exact dynamic segment from the recording while the stream keeps going.
   5. Whisper writes word-timed captions, which are burned into a 1080x1920 vertical clip.
-
-Usage
-  python clip_watcher.py CHANNEL                 watch a channel live (waits until it goes live)
-  python clip_watcher.py --file REC.ts --at 754  cut one captioned clip from a saved recording at 12:34
-
-It only works while the stream is live: it can't go back and clip a stream that already ended.
 """
 import argparse
 import csv
@@ -36,8 +31,7 @@ def log(msg):
 
 # ---------- Chat: anonymous read-only IRC over WebSocket ----------
 class ChatCounter(threading.Thread):
-    """Counts chat messages via Twitch IRC over WebSocket (port 443).
-    Twitch accepts a 'justinfan' nickname as an anonymous, read-only login."""
+    """Counts chat messages via Twitch IRC over WebSocket (port 443)."""
 
     def __init__(self, channel, stop):
         super().__init__(daemon=True)
@@ -79,12 +73,12 @@ class ChatCounter(threading.Thread):
 
 # ---------- Recording: Streamlink writes the live stream to disk ----------
 class Recorder(threading.Thread):
-    """Runs Streamlink. It waits for the channel to go live, records, and starts a new file if the stream drops."""
+    """Runs Streamlink, records live streams, and deletes finished .ts files after 60s."""
 
     def __init__(self, channel, quality, folder, stop):
         super().__init__(daemon=True)
         self.channel, self.quality, self.folder, self.stop = channel, quality, Path(folder), stop
-        self.path, self.started = None, None  # current file and the moment its first bytes arrived
+        self.path, self.started = None, None
         self.proc = None
 
     def offset(self):
@@ -125,7 +119,7 @@ class Recorder(threading.Thread):
 
 # ---------- Clip making: FFmpeg cut, Whisper captions, vertical render ----------
 _model = None
-DEVICE = 'auto'  # auto: try the GPU, fall back to the CPU
+DEVICE = 'auto'
 
 
 def whisper_model(name, cpu=False):
@@ -136,7 +130,7 @@ def whisper_model(name, cpu=False):
             try:
                 _model = WhisperModel(name, device='cuda', compute_type='float16')
                 return _model
-            except Exception:  # noqa: BLE001 - no usable GPU
+            except Exception:  # noqa: BLE001
                 if DEVICE == 'cuda':
                     raise
         _model = WhisperModel(name, device='cpu', compute_type='int8')
@@ -151,7 +145,6 @@ def srt_time(t):
 def write_captions(media, srt, model_name, words_per_cue=3):
     """Transcribes the clip with word timestamps and writes short, punchy caption cues."""
     import numpy as np
-    # Decode with FFmpeg rather than Whisper's own loader, which breaks with some PyAV versions.
     pcm = subprocess.run(['ffmpeg', '-loglevel', 'error', '-i', str(media), '-vn', '-ac', '1', '-ar', '16000', '-f', 's16le', '-'],
                          check=True, capture_output=True).stdout
     audio = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768.0
@@ -160,12 +153,11 @@ def write_captions(media, srt, model_name, words_per_cue=3):
         return [w for s in segments for w in (s.words or [])]
     try:
         words = run(whisper_model(model_name))
-    except RuntimeError as e:  # a GPU without the CUDA libraries fails here, not when loading
+    except RuntimeError as e:
         if DEVICE != 'auto':
             raise
         log(f'captions: GPU not usable ({str(e)[:60]}), using the CPU')
         words = run(whisper_model(model_name, cpu=True))
-    # Up to 3 words a caption, and a pause of more than 0.6 s always starts a new one.
     cues = []
     for w in words:
         if cues and len(cues[-1]) < words_per_cue and w.start - cues[-1][-1].end <= 0.6:
@@ -185,10 +177,8 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
     out.parent.mkdir(parents=True, exist_ok=True)
     raw = out.with_suffix('.raw.mp4')
     srt = out.with_suffix('.srt')
-    # 1. Fast cut, no re-encode: works on a recording that is still being written.
     subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-ss', f'{max(0, start):.2f}', '-i', str(src), '-t', f'{length:.2f}',
                     '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', str(raw)], check=True)
-    # 2. Vertical frame: either a centre crop, or the full frame over a blurred fill.
     if crop:
         vf = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920'
     else:
@@ -200,7 +190,6 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
         if n_words:
             style = 'FontName=Arial,Fontsize=16,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,Alignment=2,MarginV=60'
             vf += f",subtitles={srt.name}:force_style='{style}'"
-    # Run from the clip's folder so the subtitles path needs no escaping on Windows.
     subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', raw.name, '-filter_complex', vf,
                     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out.name], check=True, cwd=out.parent)
@@ -208,7 +197,7 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
     return n_words
 
 
-# ---------- The live loop ----------
+# ---------- The live loop (dynamic duration) ----------
 def watch(args):
     stop = threading.Event()
     chat = ChatCounter(args.channel, stop)
@@ -222,55 +211,114 @@ def watch(args):
     new_log = not log_file.exists()
     with open(log_file, 'a', newline='') as f:
         if new_log:
-            csv.writer(f).writerow(['time', 'messages_in_window', 'normal', 'clip'])
+            csv.writer(f).writerow(['time', 'duration', 'peak_messages', 'normal', 'clip'])
 
     def cutter():
         while True:
             path, start, end, name, msgs, base = jobs.get()
-            while rec.path == path and (rec.offset() or 0) < end + 3:  # wait until the recording has the whole clip
+            while rec.path == path and (rec.offset() or 0) < end + 3:
                 time.sleep(1)
             out = clips / f'{name}.mp4'
+            duration = round(end - start, 1)
             try:
-                words = make_clip(path, start, end - start, out, args.model, not args.no_captions, args.crop)
-                log(f'clip: {out.name} ({words} caption words)')
+                words = make_clip(path, start, duration, out, args.model, not args.no_captions, args.crop)
+                log(f'clip: {out.name} ({duration}s, {words} caption words)')
                 with open(log_file, 'a', newline='') as f:
-                    csv.writer(f).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), msgs, f'{base:.1f}', out.name])
-            except Exception as e:  # noqa: BLE001 - one bad clip must never stop the watcher
+                    csv.writer(f).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), duration, msgs, f'{base:.1f}', out.name])
+            except Exception as e:  # noqa: BLE001
                 log(f'clip failed: {e}')
 
     threading.Thread(target=cutter, daemon=True).start()
 
     history = deque(maxlen=max(6, int(args.baseline / args.window)))
-    last_clip = -1e9
+    active_clip = None  # dict holding the currently extending clip
+    last_clip_end = -1e9
     next_tick = time.monotonic() + args.window
-    log(f'watching #{args.channel}: a spike is {args.ratio}x the normal {args.window:g}-second count '
-        f'(at least {args.min_msgs} messages). Ctrl+C stops.')
+    log(f'watching #{args.channel}: dynamic clips ({args.length:g}s-{args.max_length:g}s), spike >= {args.ratio}x normal '
+        f'(min {args.min_msgs} msgs). Ctrl+C stops.')
+
+    def finalize_clip(clip):
+        nonlocal last_clip_end
+        # Enforce minimum duration (extend forward if needed) and cap at max_length
+        end = max(clip['end'], clip['start'] + args.length)
+        end = min(end, clip['start'] + args.max_length)
+        last_clip_end = end
+        dur = round(end - clip['start'], 1)
+        log(f'spike finalized: {clip["peak"]} msgs (normal {clip["normal"]:g}) -> cutting {dur}s')
+        jobs.put((clip['path'], clip['start'], end, clip['name'], clip['peak'], clip['normal']))
+
     try:
         while True:
             time.sleep(max(0, next_tick - time.monotonic()))
             next_tick += args.window
             n = chat.take()
-            if rec.started is None:  # not live yet: don't learn "normal" from the waiting room
+
+            # Stream stopped or waiting: flush any pending clip
+            if rec.started is None or rec.path is None:
+                if active_clip is not None:
+                    finalize_clip(active_clip)
+                    active_clip = None
                 history.clear()
                 if args.verbose:
                     log(f'{n} messages in the last {args.window:g} s (waiting for the recording)')
                 continue
-            normal = statistics.median(history) if len(history) >= 6 else None
-            history.append(n)
-            if args.verbose:
-                log(f'{n} messages in the last {args.window:g} s (normal {normal})')
-            if normal is None or n < max(args.min_msgs, args.ratio * max(normal, 1)):
-                continue
+
             off = rec.offset()
-            if off - last_clip < args.gap:
+            # If the recording file rotated mid-clip, finalize the old one immediately
+            if active_clip is not None and active_clip['path'] != rec.path:
+                finalize_clip(active_clip)
+                active_clip = None
+
+            normal = statistics.median(history) if len(history) >= 6 else None
+            # Keep a snapshot of recent history before appending current window
+            recent_counts = list(history)
+            history.append(n)
+
+            if args.verbose:
+                state = ' [extending clip]' if active_clip else ''
+                log(f'{n} messages in the last {args.window:g} s (normal {normal}){state}')
+
+            if normal is None:
                 continue
-            last_clip = off
-            # Chat reacts a few seconds after the moment, so most of the clip comes before the spike.
-            start = max(0, off - args.window - args.before)
-            end = start + args.length
-            name = f'{args.channel}_{time.strftime("%H%M%S")}'
-            log(f'spike: {n} messages vs a normal {normal:g}; cutting {args.length:g} s')
-            jobs.put((rec.path, start, end, name, n, normal))
+
+            warm_threshold = max(5, 1.5 * max(normal, 1))
+            spike_threshold = max(args.min_msgs, args.ratio * max(normal, 1))
+
+            # Case 1: A clip is currently open -> check if chat is still hot to extend it
+            if active_clip is not None:
+                if n >= warm_threshold and (off + 5 - active_clip['start']) < args.max_length:
+                    active_clip['end'] = off + 5
+                    active_clip['peak'] = max(active_clip['peak'], n)
+                else:
+                    finalize_clip(active_clip)
+                    active_clip = None
+                continue
+
+            # Case 2: No active clip -> check if a new spike triggers
+            if n < spike_threshold:
+                continue
+            if off - last_clip_end < args.gap:
+                continue
+
+            # Dynamic look-back: rewind further if previous windows were already heating up
+            extra_before = 0.0
+            for prev_n in reversed(recent_counts):
+                if prev_n >= warm_threshold and (args.before + extra_before + args.window) <= args.max_before:
+                    extra_before += args.window
+                else:
+                    break
+
+            start = max(0.0, off - args.window - args.before - extra_before)
+            active_clip = {
+                'path': rec.path,
+                'start': start,
+                'end': off + 5,
+                'name': f'{args.channel}_{time.strftime("%H%M%S")}',
+                'peak': n,
+                'normal': normal,
+            }
+            log(f'spike started: {n} msgs vs normal {normal:g} (lookback {args.before + extra_before:g}s)')
+
     except KeyboardInterrupt:
         log('stopping')
         stop.set()
@@ -287,9 +335,11 @@ def main():
     p.add_argument('--ratio', type=float, default=3.0, help='a spike is this many times the normal count (default: 3)')
     p.add_argument('--min-msgs', type=int, default=20, help='ignore spikes smaller than this many messages (default: 20)')
     p.add_argument('--baseline', type=float, default=180, help='seconds of chat that set "normal" (default: 180)')
-    p.add_argument('--length', type=float, default=30, help='clip length in seconds (default: 30)')
-    p.add_argument('--before', type=float, default=15, help='seconds kept before the spiking window (default: 15)')
-    p.add_argument('--gap', type=float, default=60, help='at least this many seconds between clips (default: 60)')
+    p.add_argument('--length', type=float, default=25, help='minimum clip length in seconds (default: 25)')
+    p.add_argument('--max-length', type=float, default=58, help='maximum dynamic clip length in seconds (default: 58)')
+    p.add_argument('--before', type=float, default=15, help='base seconds kept before the spiking window (default: 15)')
+    p.add_argument('--max-before', type=float, default=40, help='max lookback seconds when chat heats up early (default: 40)')
+    p.add_argument('--gap', type=float, default=45, help='at least this many seconds between clips (default: 45)')
     p.add_argument('--model', default='base', help='Whisper model: tiny, base, small, medium (default: base)')
     p.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], help='where Whisper runs (default: auto)')
     p.add_argument('--no-captions', action='store_true', help='skip Whisper captions')
