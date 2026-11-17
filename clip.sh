@@ -26,4 +26,4 @@ case "$ACTION" in
   *)
     echo "Commandes : ./clip.sh {add|rm|list|logs} [chaine]"
     ;;
-esac
+esac    

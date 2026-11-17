@@ -110,6 +110,12 @@ class Recorder(threading.Thread):
                     self.proc.terminate()
             if self.started is not None:
                 log('recorder: stream ended or dropped')
+                old_path = self.path
+                def cleanup(p):
+                    time.sleep(60)
+                    p.unlink(missing_ok=True)
+                    log(f'recorder: deleted finished recording {p.name}')
+                threading.Thread(target=cleanup, args=(old_path,), daemon=True).start()
             elif not self.stop.is_set():
                 last = [l for l in errlog.read_text(errors='replace').splitlines() if l.strip()][-1:]
                 log(f'recorder: streamlink stopped: {last[0] if last else "no output"}; retrying in 10 s')
