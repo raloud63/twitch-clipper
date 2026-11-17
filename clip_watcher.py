@@ -18,8 +18,6 @@ import argparse
 import csv
 import random
 import shutil
-import socket
-import ssl
 import statistics
 import subprocess
 import sys
@@ -29,17 +27,17 @@ from collections import deque
 from pathlib import Path
 from queue import Queue
 
-IRC_HOST, IRC_PORT = 'irc.chat.twitch.tv', 6697
+IRC_WS_URL = 'wss://irc-ws.chat.twitch.tv:443'
 
 
 def log(msg):
     print(time.strftime('%H:%M:%S'), msg, flush=True)
 
 
-# ---------- Chat: anonymous read-only IRC ----------
+# ---------- Chat: anonymous read-only IRC over WebSocket ----------
 class ChatCounter(threading.Thread):
-    """Counts chat messages. Twitch accepts a 'justinfan' nickname as an anonymous, read-only login.
-    It is long-standing community practice, not part of Twitch's documented API, so it could stop working."""
+    """Counts chat messages via Twitch IRC over WebSocket (port 443).
+    Twitch accepts a 'justinfan' nickname as an anonymous, read-only login."""
 
     def __init__(self, channel, stop):
         super().__init__(daemon=True)
@@ -53,29 +51,26 @@ class ChatCounter(threading.Thread):
         return n
 
     def run(self):
+        from websockets.sync.client import connect
         while not self.stop.is_set():
             try:
-                raw = socket.create_connection((IRC_HOST, IRC_PORT), timeout=30)
-                sock = ssl.create_default_context().wrap_socket(raw, server_hostname=IRC_HOST)
-                sock.settimeout(300)
-                sock.sendall(f'NICK justinfan{random.randint(10000, 99999)}\r\nJOIN #{self.channel}\r\n'.encode())
-                buf = b''
-                while not self.stop.is_set():
-                    data = sock.recv(8192)
-                    if not data:
-                        raise ConnectionError('chat closed the connection')
-                    buf += data
-                    *lines, buf = buf.split(b'\r\n')
-                    for line in lines:
-                        if line.startswith(b'PING'):
-                            sock.sendall(line.replace(b'PING', b'PONG', 1) + b'\r\n')
-                        elif b' PRIVMSG #' in line:
-                            with self.lock:
-                                self.count += 1
-                                self.total += 1
-                        elif b' 366 ' in line and not self.connected.is_set():  # end of the join reply
-                            self.connected.set()
-                            log(f'chat: reading #{self.channel} anonymously')
+                with connect(IRC_WS_URL, open_timeout=15) as ws:
+                    ws.send(f'NICK justinfan{random.randint(10000, 99999)}')
+                    ws.send(f'JOIN #{self.channel}')
+                    while not self.stop.is_set():
+                        msg = ws.recv(timeout=60)
+                        for line in msg.split('\r\n'):
+                            if line.startswith('PING'):
+                                ws.send(line.replace('PING', 'PONG', 1))
+                            elif ' PRIVMSG #' in line:
+                                with self.lock:
+                                    self.count += 1
+                                    self.total += 1
+                            elif ' 366 ' in line and not self.connected.is_set():
+                                self.connected.set()
+                                log(f'chat: reading #{self.channel} anonymously')
+            except TimeoutError:
+                continue
             except Exception as e:  # noqa: BLE001 - keep reconnecting whatever went wrong
                 if not self.stop.is_set():
                     log(f'chat: {e}; reconnecting in 5 s')
