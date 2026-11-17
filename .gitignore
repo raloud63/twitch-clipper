@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+output/
+*.ts
+*.mp4
+*.srt

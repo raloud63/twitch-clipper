@@ -1,0 +1,8 @@
+services:
+  clip-watcher:
+    build: .
+    container_name: twitch-clipper
+    restart: unless-stopped
+    volumes:
+      - ./output:/app/output
+    command: ["otplol_", "--out", "/app/output", "--model", "base", "--device", "cpu", "--verbose"]

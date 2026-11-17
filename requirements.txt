@@ -1,0 +1,4 @@
+streamlink>=8.0
+faster-whisper>=1.1
+numpy
+websockets
